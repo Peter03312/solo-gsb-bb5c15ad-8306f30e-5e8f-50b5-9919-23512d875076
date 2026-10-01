@@ -1374,6 +1374,277 @@ app.post('/api/merge/commit', (req, res) => {
   });
 });
 
+/* ----------------------- 共享房间（同一舞台同步观看） ----------------------- */
+// 排演人员基于一个已发布版本创建共享房间：创建者取得控制密钥，其他人凭房间码观看
+// 同一舞台与逐灯亮度。房间固定所选版本，保存播放/暂停、基准时码、速度及修订号；
+// 服务端按墙钟推算当前时码，到版本末尾自动停住；页面刷新、服务重启、观看者重连后
+// 均能恢复进度。后续草稿修改和发布不影响它。房间操作不改版本、草稿或调光记录。
+// 持密钥者可播放、暂停、跳转及设置 0.5/1/2 倍速；控制请求携带当前修订号，过期返回
+// 409 冲突且不改房间。
+
+const ROOM_CODE_LEN = 6;
+const ROOM_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 去除 0/O/1/I 等易混字符
+const ROOM_SPEEDS = [0.5, 1, 2];
+
+function genRoomCode() {
+  for (;;) {
+    let code = '';
+    const bytes = crypto.randomBytes(ROOM_CODE_LEN);
+    for (let i = 0; i < ROOM_CODE_LEN; i++) code += ROOM_CODE_ALPHABET[bytes[i] % ROOM_CODE_ALPHABET.length];
+    if (!db.prepare('SELECT 1 FROM rooms WHERE code = ?').get(code)) return code;
+  }
+}
+
+const roomSelect = `
+  SELECT r.*, v.label AS version_label
+  FROM rooms r JOIN versions v ON v.id = r.version_id
+`;
+
+function getRoomRowByCode(code) {
+  return db.prepare(`${roomSelect} WHERE r.code = ?`).get(code);
+}
+
+// 房间码归一化：去除首尾空白与内部连字符/空格并转大写；长度不符视为格式非法
+function normalizeRoomCode(raw) {
+  if (typeof raw !== 'string') return '';
+  const code = raw.trim().toUpperCase().replace(/[\s-]/g, '');
+  return code;
+}
+
+// 由版本快照求房间末尾时刻：最后一条 Cue 渐变结束时刻（无 Cue 为 0）
+function roomDurationForSnapshot(snap) {
+  return Engine.showDuration(Engine.prepareCues(snap.cues));
+}
+
+/**
+ * 读取房间当前状态：服务端按墙钟推算时码。
+ * 播放中按 time + (now - anchor_wall) * speed 推算；到末尾则自动停住并惰性落库
+ * （不改修订号：这只是时间流逝的结果，不与任何控制竞争）。
+ */
+function computeRoomState(row, { now = Date.now() / 1000, persistStopped = false } = {}) {
+  let playing = !!row.playing;
+  let time = row.time;
+  if (playing) {
+    const elapsed = Math.max(0, now - row.anchor_wall) * row.speed;
+    let t = row.time + elapsed;
+    if (t >= row.duration) {
+      t = row.duration;
+      playing = false;
+      if (persistStopped) {
+        db.prepare(
+          'UPDATE rooms SET playing = 0, time = duration, anchor_wall = ? WHERE id = ?'
+        ).run(now, row.id);
+      }
+    }
+    time = t;
+  }
+  return {
+    playing,
+    time,
+    speed: row.speed,
+    duration: row.duration,
+    revision: row.revision,
+  };
+}
+
+// 房间对外视图（创建/查询/控制共用）；state 由 computeRoomState 得到
+function buildRoomView(row, state, now) {
+  return {
+    code: row.code,
+    label: row.label,
+    version: { id: row.version_id, label: row.version_label },
+    duration: round6(state.duration),
+    playing: state.playing,
+    time: round6(state.time),
+    speed: state.speed,
+    revision: state.revision,
+    // 服务端墙钟与对应时码：观看端据此校时（基准时码 + 流逝时间 × 速度）
+    server_wall: now,
+    server_time: round6(state.time),
+  };
+}
+
+// 创建共享房间：基于已发布版本，固定版本快照，初始暂停在 0 秒
+app.post('/api/rooms', (req, res) => {
+  const versionId = toPosInt(req.body?.version_id);
+  if (Number.isNaN(versionId)) {
+    return err(res, 400, `版本编号无效：${JSON.stringify(req.body?.version_id)}（须为已发布版本的正整数编号）`);
+  }
+  const snap = loadVersionSnapshot(versionId);
+  if (!snap) return err(res, 404, `版本不存在：#${versionId}，无法基于它创建共享房间`);
+
+  const labelRaw = typeof req.body?.label === 'string' ? req.body.label.trim() : '';
+  const label = labelRaw || `共享房间（${snap.label}）`;
+  const duration = roomDurationForSnapshot(snap);
+  const now = Date.now() / 1000;
+  const code = genRoomCode();
+  const controlKey = crypto.randomBytes(24).toString('hex');
+
+  const info = db
+    .prepare(
+      `INSERT INTO rooms (code, version_id, control_key, label, playing, time, anchor_wall, speed, duration, revision, created_at)
+       VALUES (?, ?, ?, ?, 0, 0, ?, 1, ?, 0, ?)`
+    )
+    .run(code, versionId, controlKey, label, now, duration, now);
+
+  const row = db.prepare(`${roomSelect} WHERE r.id = ?`).get(info.lastInsertRowid);
+  const state = computeRoomState(row, { now });
+  res.status(201).json({
+    ...buildRoomView(row, state, now),
+    // 控制密钥仅在创建响应中完整返回一次；之后任何接口都不再回显
+    control_key: controlKey,
+  });
+});
+
+// 加入/查看房间：凭房间码（无需密钥）只读服务端状态，观看端按返回的服务端墙钟校时
+app.get('/api/rooms/:code', (req, res) => {
+  const code = normalizeRoomCode(req.params.code);
+  if (code.length !== ROOM_CODE_LEN) {
+    return err(res, 400, `房间码无效：${JSON.stringify(req.params.code)}（须为 ${ROOM_CODE_LEN} 位房间码）`);
+  }
+  let row = getRoomRowByCode(code);
+  if (!row) return err(res, 404, `房间不存在：房间码 ${code}（请核对后重新加入）`);
+  const now = Date.now() / 1000;
+  // 到末尾自动停住：此处惰性落库，刷新/重启/重连后状态一致
+  const state = computeRoomState(row, { now, persistStopped: true });
+  if (!state.playing) row = getRoomRowByCode(code);
+  res.json(buildRoomView(row, state, now));
+});
+
+// 房间控制：持密钥者播放/暂停/跳转/设置速度；携带修订号，过期 409 且不改房间
+app.post('/api/rooms/:code/control', (req, res) => {
+  const code = normalizeRoomCode(req.params.code);
+  if (code.length !== ROOM_CODE_LEN) {
+    return err(res, 400, `房间码无效：${JSON.stringify(req.params.code)}（须为 ${ROOM_CODE_LEN} 位房间码）`);
+  }
+  const row = getRoomRowByCode(code);
+  if (!row) return err(res, 404, `房间不存在：房间码 ${code}（请核对后重试）`);
+
+  // 控制密钥：必须携带且正确（不回显房间当前密钥；等长比较避免计时侧信道）
+  const key = req.body?.control_key;
+  if (key === undefined || key === null || key === '') {
+    return err(res, 403, '缺少控制密钥：仅房间创建者（持密钥者）可以控制播放，请在页面填写密钥');
+  }
+  const keyBuf = Buffer.from(String(key));
+  const expectedBuf = Buffer.from(row.control_key);
+  if (keyBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(keyBuf, expectedBuf)) {
+    return err(res, 403, '控制密钥无效：无权控制该房间（观看者只能同步观看）');
+  }
+
+  // 修订号：必须携带且与当前一致（先按墙钟惰性推算，末尾自动停住不改修订号）
+  if (req.body === null || typeof req.body !== 'object' || !('revision' in req.body)) {
+    return err(res, 400, '控制请求必须携带房间修订号 revision（与服务器当前修订号一致才允许控制）');
+  }
+  const clientRev = toNum(req.body.revision);
+  if (!Number.isInteger(clientRev) || clientRev < 0) {
+    return err(res, 400, `修订号无效：${JSON.stringify(req.body.revision)}（须为非负整数）`);
+  }
+
+  const action = req.body.action;
+  if (!['play', 'pause', 'seek', 'speed'].includes(action)) {
+    return err(
+      res,
+      400,
+      `非法控制动作：${JSON.stringify(action)}（须为 play 播放 / pause 暂停 / seek 跳转 / speed 设置速度）`
+    );
+  }
+
+  // 跳转时码：非负数字且不得超过版本末尾
+  let seekTime = null;
+  if (action === 'seek') {
+    seekTime = toNum(req.body.time);
+    if (Number.isNaN(seekTime)) {
+      return err(res, 400, `非法时码：${JSON.stringify(req.body.time)}（须为数字秒数）`);
+    }
+    if (seekTime < 0) return err(res, 400, `非法时码：${seekTime}（不得为负）`);
+    if (seekTime > row.duration) {
+      return err(res, 400, `时码越界：${seekTime}（房间固定版本长度为 ${round6(row.duration)} 秒，不得跳到末尾之后）`);
+    }
+  }
+
+  // 速度：仅允许现有的 0.5 / 1 / 2 倍
+  let speed = null;
+  if (action === 'speed') {
+    speed = toNum(req.body.speed);
+    if (!ROOM_SPEEDS.some((s) => Math.abs(s - speed) <= 1e-12)) {
+      return err(res, 400, `非法速度：${JSON.stringify(req.body.speed)}（仅支持 0.5、1、2 倍速）`);
+    }
+  }
+
+  const now = Date.now() / 1000;
+  const tx = db.transaction(() => {
+    const cur = db.prepare(`${roomSelect} WHERE r.id = ?`).get(row.id);
+    // 事务内复查密钥与修订号（双保险）
+    if (cur.control_key !== key) {
+      const e = new Error('ROOM_FORBIDDEN');
+      e.code = 'ROOM_FORBIDDEN';
+      throw e;
+    }
+    if (cur.revision !== clientRev) {
+      const e = new Error(`ROOM_CONFLICT:${cur.revision}`);
+      e.code = 'ROOM_CONFLICT';
+      e.current = cur.revision;
+      throw e;
+    }
+    const live = computeRoomState(cur, { now, persistStopped: false });
+
+    let { playing, time } = live;
+    let nextSpeed = cur.speed;
+    let anchor = now;
+
+    if (action === 'play') {
+      if (live.time >= cur.duration) {
+        if (cur.duration <= 0) {
+          const e = new Error('ROOM_ZERO_DURATION');
+          e.code = 'ROOM_ZERO_DURATION';
+          throw e;
+        }
+        time = 0; // 已停在末尾：再播放从头开始
+      }
+      playing = true;
+    } else if (action === 'pause') {
+      playing = false;
+      anchor = now; // 暂停：把推算出的当前时码固化为新的基准
+    } else if (action === 'seek') {
+      time = seekTime;
+      if (seekTime >= cur.duration) playing = false; // 跳到末尾即停住
+      // 播放/暂停状态沿用（播放则从新时码起按速度继续；暂停锚住该时码）
+    } else {
+      // speed：以当前推算时码为新基准，立刻按新速度走
+      nextSpeed = speed;
+    }
+
+    db.prepare(
+      `UPDATE rooms SET playing = ?, time = ?, anchor_wall = ?, speed = ?, revision = revision + 1
+       WHERE id = ?`
+    ).run(playing ? 1 : 0, time, anchor, nextSpeed, cur.id);
+    return db.prepare(`${roomSelect} WHERE r.id = ?`).get(cur.id);
+  });
+
+  let updated;
+  try {
+    updated = tx();
+  } catch (e) {
+    if (e.code === 'ROOM_CONFLICT') {
+      return err(
+        res,
+        409,
+        `修订号冲突：提交基于修订号 ${clientRev}，房间当前已为修订号 ${e.current}；请按服务端最新状态校时后重试（本次未改动房间）`
+      );
+    }
+    if (e.code === 'ROOM_FORBIDDEN') {
+      return err(res, 403, '控制密钥无效：无权控制该房间（本次未改动房间）');
+    }
+    if (e.code === 'ROOM_ZERO_DURATION') {
+      return err(res, 400, '该房间固定的版本时长为 0（没有 Cue），无法播放');
+    }
+    throw e;
+  }
+
+  const state = computeRoomState(updated, { now });
+  res.json(buildRoomView(updated, state, now));
+});
+
 /* ------------------------------- 错误处理 ------------------------------ */
 
 // JSON 解析失败（如非法时码导致的畸形 JSON 之外的格式错误）
@@ -1390,7 +1661,12 @@ app.get(/^(?!\/api\/).*/, (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-app.listen(PORT, () => {
-  console.log(`小剧场灯光 Cue 排演应用已启动: http://localhost:${PORT}`);
-  console.log(`数据库: ${DB_PATH}`);
-});
+// 直接运行（node server.js / npm start / Docker）时启动监听；被测试 require 时只导出 app
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`小剧场灯光 Cue 排演应用已启动: http://localhost:${PORT}`);
+    console.log(`数据库: ${DB_PATH}`);
+  });
+}
+
+module.exports = { app, PORT, DB_PATH };

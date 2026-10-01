@@ -30,7 +30,11 @@ async function api(method, url, body) {
   });
   if (res.status === 204) return null;
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `请求失败（${res.status}）`);
+  if (!res.ok) {
+    const e = new Error(data.error || `请求失败（${res.status}）`);
+    e.status = res.status;
+    throw e;
+  }
   return data;
 }
 
@@ -330,6 +334,7 @@ async function loadVersions({ keepSelection = true } = {}) {
   renderRecordVersionOptions();
   renderLoadOptions();
   renderMergeOptions();
+  renderRoomVersionOptions();
   if (keepSelection) {
     if (state.versions.some((v) => String(v.id) === String(prevA))) $('cmp-version-a').value = prevA;
     if (state.versions.some((v) => String(v.id) === String(prevB))) $('cmp-version-b').value = prevB;
@@ -486,25 +491,12 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
-function renderPlayer() {
-  const s = state.session;
-  const t = state.time;
-
-  $('time-current').textContent = fmt(t);
-  const tl = $('timeline');
-  tl.value = String(t);
-
-  if (!s) {
-    $('stage').innerHTML = '<p class="muted" style="margin:auto">暂无演出版本</p>';
-    $('levels').innerHTML = '';
-    $('cue-timeline').querySelector('tbody').innerHTML = '';
-    return;
-  }
-
-  const levels = Engine.levelsAt(s.cues, s.lights, t);
+// 舞台 / 亮度条 / Cue 状态的通用渲染：本地播放与共享房间共用同一套渐变规则
+function renderStageInto(session, t, stageEl, levelsEl, cueEl) {
+  const levels = Engine.levelsAt(session.cues, session.lights, t);
 
   // 舞台灯具
-  $('stage').innerHTML = s.lights
+  stageEl.innerHTML = session.lights
     .map((l) => {
       const v = Math.round(levels[l.id] * 10) / 10;
       const a = v / 100;
@@ -521,7 +513,7 @@ function renderPlayer() {
     .join('');
 
   // 亮度条
-  $('levels').innerHTML = s.lights
+  levelsEl.innerHTML = session.lights
     .map((l) => {
       const v = levels[l.id];
       return `
@@ -534,8 +526,8 @@ function renderPlayer() {
 
   // Cue 时间线状态
   const nameOf = {};
-  s.lights.forEach((l) => (nameOf[l.id] = l.name));
-  $('cue-timeline').querySelector('tbody').innerHTML = s.cues
+  session.lights.forEach((l) => (nameOf[l.id] = l.name));
+  cueEl.querySelector('tbody').innerHTML = session.cues
     .map((c) => {
       const end = c.time + c.duration;
       let status, cls;
@@ -560,6 +552,283 @@ function renderPlayer() {
         </tr>`;
     })
     .join('');
+}
+
+function renderPlayer() {
+  const s = state.session;
+  const t = state.time;
+
+  $('time-current').textContent = fmt(t);
+  const tl = $('timeline');
+  tl.value = String(t);
+
+  if (!s) {
+    $('stage').innerHTML = '<p class="muted" style="margin:auto">暂无演出版本</p>';
+    $('levels').innerHTML = '';
+    $('cue-timeline').querySelector('tbody').innerHTML = '';
+    return;
+  }
+
+  renderStageInto(s, t, $('stage'), $('levels'), $('cue-timeline'));
+}
+
+/* ----------------------------- 共享房间 ----------------------------- */
+// 创建者持控制密钥，其他人凭房间码加入；观看端以服务端墙钟校时（基准时码 +
+// 流逝时间 × 速度），每秒轮询一次服务端状态做纠正，刷新/重连自动恢复。
+
+const HASH_ROOM = 'room';
+const ROOM_KEY_STORE = 'cue-room-keys'; // { 房间码: 控制密钥 }，创建者刷新后仍可控制
+const ROOM_POLL_MS = 1000;
+
+function loadRoomKeyStore() {
+  try {
+    return JSON.parse(localStorage.getItem(ROOM_KEY_STORE) || '{}');
+  } catch {
+    return {};
+  }
+}
+function saveRoomKey(code, key) {
+  const store = loadRoomKeyStore();
+  if (key) store[code] = key;
+  else delete store[code];
+  localStorage.setItem(ROOM_KEY_STORE, JSON.stringify(store));
+}
+
+state.room = null; // { view, session, key, anchor:{wall,time,speed,playing}, pollTimer, rafId }
+
+function renderRoomVersionOptions() {
+  const sel = $('room-create-version');
+  if (state.versions.length === 0) {
+    sel.innerHTML = '<option value="">— 暂无已发布版本 —</option>';
+    return;
+  }
+  sel.innerHTML = state.versions
+    .map((v) => `<option value="${v.id}">#${v.id} ${esc(v.label)}（${v.cue_count} 条 Cue）</option>`)
+    .join('');
+}
+
+$('form-room-create').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  clearErr($('room-create-error'));
+  $('room-created').hidden = true;
+  const version_id = $('room-create-version').value;
+  if (!version_id) return showErr($('room-create-error'), '还没有已发布版本，请先到「发布版本」页冻结一版。');
+  try {
+    const d = await api('POST', '/api/rooms', { version_id, label: $('room-create-label').value });
+    $('room-create-label').value = '';
+    saveRoomKey(d.code, d.control_key);
+    $('room-created').hidden = false;
+    $('room-created').innerHTML =
+      `房间已创建：房间码 <b class="room-code">${esc(d.code)}</b>（已复制到剪贴板失败时可手动复制）。` +
+      `控制密钥仅显示这一次，请妥善保存：<code>${esc(d.control_key)}</code>` +
+      ` 其他人凭房间码即可观看同一舞台。`;
+    await enterRoom(d.code, d.control_key, d);
+  } catch (err2) {
+    showErr($('room-create-error'), err2.message);
+  }
+});
+
+$('form-room-join').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  clearErr($('room-join-error'));
+  const code = $('room-join-code').value.trim().toUpperCase();
+  const key = $('room-join-key').value.trim();
+  if (!code) return showErr($('room-join-error'), '请输入房间码。');
+  try {
+    await enterRoom(code, key || null);
+  } catch (err2) {
+    showErr($('room-join-error'), err2.message);
+  }
+});
+
+$('btn-room-copy-code').addEventListener('click', async () => {
+  const code = $('room-code-view').textContent;
+  try {
+    await navigator.clipboard.writeText(code);
+  } catch {
+    /* 剪贴板不可用时忽略：房间码始终可见可手选 */
+  }
+});
+
+// 加入房间：拉取服务端状态 + 固定版本快照（之后草稿/新发布不影响本房间）
+async function enterRoom(code, key, initialView) {
+  clearErr($('room-error'));
+  const view = initialView || (await api('GET', `/api/rooms/${encodeURIComponent(code)}`));
+  const snap = await api('GET', `/api/versions/${view.version.id}`);
+  const cues = Engine.prepareCues(snap.cues);
+  state.room = {
+    view,
+    key: key || loadRoomKeyStore()[view.code] || null,
+    session: {
+      id: snap.id,
+      label: snap.label,
+      lights: snap.lights,
+      cues,
+      duration: Engine.showDuration(cues),
+    },
+  };
+  applyRoomAnchor(view);
+
+  $('room-lobby').hidden = true;
+  $('room-workspace').hidden = false;
+  $('room-code-view').textContent = view.code;
+  $('room-info').textContent =
+    `固定版本 #${view.version.id}：${view.version.label} · ${view.label}`;
+  $('room-timeline').max = String(Math.max(view.duration, 0));
+  $('room-time-total').textContent = fmt(view.duration);
+  $('room-key-input').value = state.room.key || '';
+  history.replaceState(null, '', `#${HASH_ROOM}=${view.code}`);
+
+  startRoomLoop();
+  renderRoomRole();
+  renderRoom();
+
+  document.querySelector('.tab[data-tab="room"]').click();
+}
+
+// 服务端状态 -> 本地推算锚点（校时基准）
+function applyRoomAnchor(view) {
+  state.room.anchor = {
+    wall: view.server_wall,
+    time: view.server_time,
+    speed: view.speed,
+    playing: view.playing,
+  };
+}
+
+// 当前按服务端锚点推算出的本地时码；到末尾自动停住（与服务端同规则）
+function roomCurrentTime(nowSec) {
+  const a = state.room.anchor;
+  if (!a.playing) return Math.min(a.time, state.room.view.duration);
+  const t = a.time + Math.max(0, nowSec - a.wall) * a.speed;
+  return Math.min(t, state.room.view.duration);
+}
+
+function startRoomLoop() {
+  stopRoomLoop();
+  state.room.pollTimer = setInterval(pollRoom, ROOM_POLL_MS);
+  const loop = () => {
+    if (!state.room) return;
+    renderRoom();
+    state.room.rafId = requestAnimationFrame(loop);
+  };
+  state.room.rafId = requestAnimationFrame(loop);
+}
+
+function stopRoomLoop() {
+  if (!state.room) return;
+  if (state.room.pollTimer) clearInterval(state.room.pollTimer);
+  if (state.room.rafId) cancelAnimationFrame(state.room.rafId);
+  state.room.pollTimer = null;
+  state.room.rafId = null;
+}
+
+// 轮询服务端状态：观看端按它校时，持有者也借此感知（多标签等）冲突后的新修订号
+async function pollRoom() {
+  if (!state.room) return;
+  try {
+    const view = await api('GET', `/api/rooms/${encodeURIComponent(state.room.view.code)}`);
+    state.room.view = view;
+    applyRoomAnchor(view);
+    $('room-speed').value = String(view.speed);
+    renderRoomRole();
+  } catch {
+    /* 单次轮询失败不打断观看：下一周期重试 */
+  }
+}
+
+function renderRoomRole() {
+  const r = state.room;
+  if (!r) return;
+  const isHost = !!r.key;
+  $('room-role').innerHTML = isHost
+    ? '<span class="badge fading">持密钥者（可控制）</span>'
+    : '<span class="badge waiting">观看者（只读，按服务端校时）</span>';
+  $('room-key-line').style.display = isHost ? 'none' : '';
+  $('room-transport').classList.toggle('is-viewer', !isHost);
+}
+
+$('btn-room-apply-key').addEventListener('click', () => {
+  const r = state.room;
+  if (!r) return;
+  const key = $('room-key-input').value.trim();
+  if (!key) return showErr($('room-error'), '请填写控制密钥（留空则保持观看者身份）。');
+  r.key = key; // 乐观更新；密钥是否正确在下次控制时由服务端裁定
+  saveRoomKey(r.view.code, key);
+  clearErr($('room-error'));
+  renderRoomRole();
+});
+
+// 统一控制入口：携带当前修订号；服务端响应即新锚点。409 冲突时先校时再提示重试
+async function roomControl(action, extra = {}) {
+  const r = state.room;
+  if (!r) return;
+  if (!r.key) return showErr($('room-error'), '观看者不能控制房间：请在上方输入创建者的控制密钥。');
+  clearErr($('room-error'));
+  try {
+    const view = await api('POST', `/api/rooms/${encodeURIComponent(r.view.code)}/control`, {
+      control_key: r.key,
+      revision: r.view.revision,
+      action,
+      ...extra,
+    });
+    r.view = view;
+    applyRoomAnchor(view);
+    $('room-speed').value = String(view.speed);
+    renderRoomRole();
+  } catch (err2) {
+    if (err2.status === 409) {
+      await pollRoom(); // 过期：按服务端最新状态校时后提示重试
+    } else {
+      $('room-speed').value = String(r.view.speed); // 被拒绝（如非法速度）：回滚本地选择
+    }
+    showErr($('room-error'), `控制失败：${err2.message}`);
+  }
+}
+
+$('btn-room-play').addEventListener('click', () => roomControl('play'));
+$('btn-room-pause').addEventListener('click', () => roomControl('pause'));
+$('btn-room-stop').addEventListener('click', () => roomControl('pause').then(() => roomControl('seek', { time: 0 })));
+$('btn-room-jump').addEventListener('click', () => {
+  const raw = $('room-jump-time').value;
+  const t = Number(raw);
+  if (!Number.isFinite(t)) return showErr($('room-error'), '跳转时刻必须是数字。');
+  if (t < 0) return showErr($('room-error'), `非法时码：${raw}（不得为负）。`);
+  roomControl('seek', { time: t });
+});
+$('room-speed').addEventListener('change', (e) => {
+  const r = state.room;
+  if (!r) return;
+  if (!r.key) {
+    e.target.value = String(r.view.speed); // 观看者改速度只影响本地？不：速度由房间统一，回滚
+    return;
+  }
+  roomControl('speed', { speed: Number(e.target.value) });
+});
+
+$('btn-room-leave').addEventListener('click', () => {
+  leaveRoom();
+});
+
+function leaveRoom() {
+  stopRoomLoop();
+  state.room = null;
+  $('room-workspace').hidden = true;
+  $('room-lobby').hidden = false;
+  $('room-join-code').value = '';
+  $('room-join-key').value = '';
+  if (readHash()[HASH_ROOM]) history.replaceState(null, '', window.location.pathname);
+  document.querySelector('.tab[data-tab="player"]').click();
+}
+
+function renderRoom() {
+  const r = state.room;
+  if (!r) return;
+  const t = roomCurrentTime(Date.now() / 1000);
+  $('room-time-current').textContent = fmt(t);
+  $('room-timeline').value = String(t);
+  $('room-revision-view').textContent = String(r.view.revision);
+  renderStageInto(r.session, t, $('room-stage'), $('room-levels'), $('room-cue-timeline'));
 }
 
 /* ----------------------------- 版本比对 ----------------------------- */
@@ -1217,9 +1486,17 @@ $('btn-merge-commit').addEventListener('click', async () => {
     renderRecordVersionOptions();
     renderRecordTable();
     renderLoadOptions();
+    renderRoomVersionOptions();
 
-    // 刷新后按 #record=<id>&t=<time> 重算该记录
+    // 刷新后按 #room=<房间码> 自动重连（密钥从本地存储恢复；无密钥即以观看者加入）
     const hash = readHash();
+    if (hash[HASH_ROOM]) {
+      try {
+        await enterRoom(hash[HASH_ROOM].toUpperCase(), loadRoomKeyStore()[hash[HASH_ROOM].toUpperCase()] || null);
+      } catch (roomErr) {
+        showErr($('room-join-error'), roomErr.message);
+      }
+    }
     if (hash[HASH_RECORD]) {
       const rid = Number(hash[HASH_RECORD]);
       if (state.records.some((r) => r.id === rid)) {

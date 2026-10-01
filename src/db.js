@@ -116,6 +116,25 @@ CREATE TABLE IF NOT EXISTS merge_previews (
   payload      TEXT NOT NULL,
   created_at   REAL NOT NULL
 );
+
+-- 共享房间：基于一个已发布版本创建，创建者持控制密钥，其他人凭房间码观看同一舞台。
+-- 房间固定所选版本（version_id 指向不可变快照）；保存播放/暂停、基准时码与基准墙钟、
+-- 速度与修订号。服务端按 (time + (now - anchor_wall)*speed) 推算当前时码，
+-- 到 duration 自动停住（惰性落库）；页面刷新、服务重启、观看者重连后均可据此恢复进度。
+CREATE TABLE IF NOT EXISTS rooms (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  code        TEXT NOT NULL UNIQUE,          -- 房间码（6 位大写字母数字，去除易混字符）
+  version_id  INTEGER NOT NULL REFERENCES versions(id), -- 房间固定的已发布版本
+  control_key TEXT NOT NULL,                 -- 控制密钥（仅创建时返回一次）
+  label       TEXT NOT NULL,
+  playing     INTEGER NOT NULL DEFAULT 0,    -- 1 播放中 / 0 暂停或停在末尾
+  time        REAL NOT NULL DEFAULT 0,       -- 基准时码（最近一次控制时的演出秒数）
+  anchor_wall REAL NOT NULL,                 -- 基准墙钟（Date.now()/1000，播放按它推算）
+  speed       REAL NOT NULL DEFAULT 1,       -- 仅允许 0.5 / 1 / 2
+  duration    REAL NOT NULL,                 -- 创建时按版本快照算出的末尾时刻（一并冻结）
+  revision    INTEGER NOT NULL DEFAULT 0,   -- 控制修订号：每次成功控制 +1，过期提交 409
+  created_at  REAL NOT NULL
+);
 `;
 
 let db;
